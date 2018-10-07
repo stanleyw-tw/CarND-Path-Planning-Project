@@ -9,6 +9,7 @@
 #include "Eigen-3.3/Eigen/Dense"
 #include "Eigen-3.3/Eigen/QR"
 #include "json.hpp"
+#include "spline.h"
 
 using namespace std;
 
@@ -139,7 +140,8 @@ vector<double> getFrenet(double x, double y, double theta, const vector<double> 
 }
 
 // Transform from Frenet s,d coordinates to Cartesian x,y
-vector<double> getXY(double s, double d, const vector<double> &maps_s, const vector<double> &maps_x, const vector<double> &maps_y)
+vector<double> getXY(double s, double d, vector<double> maps_s,
+    vector<double> maps_x, vector<double> maps_y, vector<double> maps_dx, vector<double> maps_dy)
 {
 	int prev_wp = -1;
 
@@ -149,21 +151,54 @@ vector<double> getXY(double s, double d, const vector<double> &maps_s, const vec
 	}
 
 	int wp2 = (prev_wp+1)%maps_x.size();
+        /*old
+                double heading =
+        atan2((maps_y[wp2]-maps_y[prev_wp]),(maps_x[wp2]-maps_x[prev_wp]));
+                // the x,y,s along the segment
+                double seg_s = (s-maps_s[prev_wp]);
 
-	double heading = atan2((maps_y[wp2]-maps_y[prev_wp]),(maps_x[wp2]-maps_x[prev_wp]));
-	// the x,y,s along the segment
-	double seg_s = (s-maps_s[prev_wp]);
+                double seg_x = maps_x[prev_wp]+seg_s*cos(heading);
+                double seg_y = maps_y[prev_wp]+seg_s*sin(heading);
 
-	double seg_x = maps_x[prev_wp]+seg_s*cos(heading);
-	double seg_y = maps_y[prev_wp]+seg_s*sin(heading);
+                // calculate XY with spline
+                int spline_points = 6;
+                vector<double> X(spline_points), Y(spline_points);
+                for(int i=0; i < spline_points; i++) {
+                    int wp = (prev_wp + i - 2) % maps_x.size();
+                    X[i] = maps_x[wp];
+                    Y[i] = maps_y[wp];
+                }
 
-	double perp_heading = heading-pi()/2;
+                double perp_heading = heading-pi()/2;
 
-	double x = seg_x + d*cos(perp_heading);
-	double y = seg_y + d*sin(perp_heading);
+                double x = seg_x + d*cos(perp_heading);
+                double y = seg_y + d*sin(perp_heading);
 
-	return {x,y};
+                return {x,y};
+        old */
+        // calculate XY with spline
+        int spline_points = 6;
+        vector<double> X(spline_points), Y(spline_points);
+        for (int i = 0; i < spline_points; i++) {
+          int wp = (prev_wp + i - 2) % maps_x.size();
+          X[i] = maps_x[wp];
+          Y[i] = maps_y[wp];
+        }
 
+        tk::spline spline_func;
+        spline_func.set_points(X, Y);
+        double ratio = (s - maps_s[prev_wp]) / (maps_s[wp2] - maps_s[prev_wp]);
+        double x = maps_x[prev_wp] + (maps_x[wp2] - maps_x[prev_wp]) * ratio;
+        double y = spline_func(x);
+        // add d * unit norm vector
+        double nx =
+            maps_dx[prev_wp] + ratio * (maps_dx[wp2] - maps_dx[prev_wp]);
+        double ny =
+            maps_dy[prev_wp] + ratio * (maps_dy[wp2] - maps_dy[prev_wp]);
+        x = x + d * nx;
+        y = y + d * ny;
+
+        return {x, y};
 }
 
 /* Stanley JMT: jerk minimized trajectory */
@@ -222,12 +257,12 @@ double poly_eval(double x, vector<double> coeffs) {
 vector<vector<vector<double>>>
 generate_trajectories(string behavior, const json &car,
                       const json &sensor_fusion, vector<double> maps_s,
-                      vector<double> maps_x, vector<double> maps_y) {
+                      vector<double> maps_x, vector<double> maps_y, vector<double> maps_dx, vector<double> maps_dy) {
   const double time_step = 0.02;
   vector<vector<vector<double>>> trajectories;
   if (behavior.compare("full_speed_ahead") == 0) {
     // should reach target config state in t seconds
-    double t = 1.0;
+    double t = 2.0;
     double car_x = car["x"];
     double car_y = car["y"];
     double car_s = car["s"];
@@ -244,9 +279,10 @@ generate_trajectories(string behavior, const json &car,
     double end_path_d = car["end_path_d"];
     // 40 mph ~= 17.88 mps
     double target_s = car_s + t * 17.88;
-    double target_d = round(car_d);
+    //double target_d = round(car_d);
+    double target_d = 6.0;
     double target_speed = 17.88;
-    if (previous_path_x.size() < 5) {
+    if (previous_path_x.size() <= 3) {
       vector<double> start_s = {car_s, car_speed, 0.0};
       vector<double> end_s = {target_s, target_speed, 0.0};
       auto s_trajectory_coeff = JMT(start_s, end_s, t);
@@ -258,7 +294,7 @@ generate_trajectories(string behavior, const json &car,
       for (double i = time_step; i <= t; i += time_step) {
         double s = poly_eval(i, s_trajectory_coeff);
         double d = poly_eval(i, d_trajectory_coeff);
-        vector<double> point = getXY(s, d, maps_s, maps_x, maps_y);
+        vector<double> point = getXY(s, d, maps_s, maps_x, maps_y, maps_dx, maps_dy);
         next_x_vals.push_back(point[0]);
         next_y_vals.push_back(point[1]);
       }
@@ -366,7 +402,7 @@ h.onMessage([&map_waypoints_x,&map_waypoints_y,&map_waypoints_s,&map_waypoints_d
                 //Trajectory Genereation
                 auto trajectories = generate_trajectories(
                     current_behavior, j[1], sensor_fusion, map_waypoints_s,
-                    map_waypoints_x, map_waypoints_y);
+                    map_waypoints_x, map_waypoints_y, map_waypoints_dx, map_waypoints_dy);
                 auto best_trajectory =
                     find_best_trajectory(trajectories, sensor_fusion);
                 next_x_vals = best_trajectory[0];
